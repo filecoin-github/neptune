@@ -3,10 +3,11 @@ use crate::error::Error;
 use crate::hash_type::HashType;
 use crate::poseidon::PoseidonConstants;
 use crate::{Arity, BatchHasher, Strength, DEFAULT_STRENGTH};
-use bellperson::bls::{Bls12, Fr, FrRepr};
-use ff::{PrimeField, PrimeFieldDecodingError};
+use blstrs::Scalar as Fr;
+use ff::PrimeField;
 use generic_array::{typenum, ArrayLength, GenericArray};
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -102,8 +103,8 @@ impl BatcherState {
     }
 }
 
-/// `GPUBatchHasher` implements `BatchHasher` and performs the batched hashing on GPU.
-pub struct GPUBatchHasher<A> {
+/// `GpuBatchHasher` implements `BatchHasher` and performs the batched hashing on GPU.
+pub struct GpuBatchHasher<A> {
     ctx: Arc<Mutex<FutharkContext>>,
     state: BatcherState,
     /// If `tree_builder_state` is provided, use it to build the final 64MiB tree on the GPU with one call.
@@ -112,11 +113,11 @@ pub struct GPUBatchHasher<A> {
     _a: PhantomData<A>,
 }
 
-impl<A> GPUBatchHasher<A>
+impl<A> GpuBatchHasher<A>
 where
     A: Arity<Fr>,
 {
-    /// Create a new `GPUBatchHasher` and initialize it with state corresponding with its `A`.
+    /// Create a new `GpuBatchHasher` and initialize it with state corresponding with its `A`.
     pub(crate) fn new(
         ctx: Arc<Mutex<FutharkContext>>,
         max_batch_size: usize,
@@ -124,7 +125,7 @@ where
         Self::new_with_strength(ctx, DEFAULT_STRENGTH, max_batch_size)
     }
 
-    /// Create a new `GPUBatchHasher` and initialize it with state corresponding with its `A`.
+    /// Create a new `GpuBatchHasher` and initialize it with state corresponding with its `A`.
     pub(crate) fn new_with_strength(
         ctx: Arc<Mutex<FutharkContext>>,
         strength: Strength,
@@ -155,7 +156,7 @@ where
     }
 }
 
-impl<A> Drop for GPUBatchHasher<A> {
+impl<A> Drop for GpuBatchHasher<A> {
     fn drop(&mut self) {
         let ctx = self.ctx.lock().unwrap();
         let mut locked = BATCH_HASHERS.lock().unwrap();
@@ -174,7 +175,7 @@ impl<A> Drop for GPUBatchHasher<A> {
     }
 }
 
-impl<A> BatchHasher<A> for GPUBatchHasher<A>
+impl<A> BatchHasher<A> for GpuBatchHasher<A>
 where
     A: Arity<Fr>,
 {
@@ -192,11 +193,11 @@ where
 }
 
 #[derive(Debug)]
-struct GPUConstants<A>(PoseidonConstants<Bls12, A>)
+struct GpuConstants<A>(PoseidonConstants<Fr, A>)
 where
     A: Arity<Fr>;
 
-impl<A> GPUConstants<A>
+impl<A> GpuConstants<A>
 where
     A: Arity<Fr>,
 {
@@ -242,7 +243,7 @@ where
 fn frs_to_u64s(frs: &[Fr]) -> Vec<u64> {
     let mut res = vec![u64::default(); frs.len() * 4];
     for (src, dest) in frs.iter().zip(res.chunks_mut(4)) {
-        dest.copy_from_slice(&src.into_repr().0);
+        dest.copy_from_slice(&fr_to_u64s(src));
     }
     res
 }
@@ -255,15 +256,15 @@ fn frs_2d_to_u64s(frs_2d: &[Vec<Fr>]) -> Vec<u64> {
 }
 
 fn array_u64_1d_from_fr(ctx: &FutharkContext, fr: Fr) -> Result<Array_u64_1d, Error> {
-    Array_u64_1d::from_vec(*ctx, &fr.into_repr().0, &[4, 1])
-        .map_err(|e| Error::Other(format!("error converting Fr: {:?}", e).to_string()))
+    Array_u64_1d::from_vec(*ctx, &fr_to_u64s(&fr), &[4, 1])
+        .map_err(|e| Error::Other(format!("error converting Fr: {:?}", e)))
 }
 
 fn array_u64_1d_from_frs(ctx: &FutharkContext, frs: &[Fr]) -> Result<Array_u64_1d, Error> {
     let u64s = frs_to_u64s(frs);
 
     Array_u64_1d::from_vec(*ctx, u64s.as_slice(), &[(frs.len() * 4) as i64, 1])
-        .map_err(|e| Error::Other(format!("error converting Fr: {:?}", e).to_string()))
+        .map_err(|e| Error::Other(format!("error converting Fr: {:?}", e)))
 }
 
 fn array_u64_2d_from_frs(ctx: &FutharkContext, frs: &[Fr]) -> Result<Array_u64_2d, Error> {
@@ -274,7 +275,7 @@ fn array_u64_2d_from_frs(ctx: &FutharkContext, frs: &[Fr]) -> Result<Array_u64_2
     let dim = [d1, d2];
 
     Array_u64_2d::from_vec(*ctx, u64s.as_slice(), &dim)
-        .map_err(|e| Error::Other(format!("error converting Frs: {:?}", e).to_string()))
+        .map_err(|e| Error::Other(format!("error converting Frs: {:?}", e)))
 }
 
 fn array_u64_3d_from_frs_2d(
@@ -298,17 +299,29 @@ fn array_u64_3d_from_frs_2d(
     let dim = [d3, d2, d1];
 
     Array_u64_3d::from_vec(*ctx, u64s.as_slice(), &dim)
-        .map_err(|e| Error::Other(format!("error converting Frs 2d: {:?}", e).to_string()))
+        .map_err(|e| Error::Other(format!("error converting Frs 2d: {:?}", e)))
 }
 
-pub fn u64s_into_fr(limbs: &[u64]) -> Result<Fr, PrimeFieldDecodingError> {
+pub fn u64s_into_fr(limbs: &[u64]) -> Result<Fr, Error> {
     assert_eq!(limbs.len(), 4);
-    let mut limb_arr = [0; 4];
-    limb_arr.copy_from_slice(&limbs[..]);
-    let repr = FrRepr(limb_arr);
-    let fr = Fr::from_repr(repr);
+    let mut le_bytes = [0u8; 32];
+    le_bytes[0..8].copy_from_slice(&limbs[0].to_le_bytes());
+    le_bytes[8..16].copy_from_slice(&limbs[1].to_le_bytes());
+    le_bytes[16..24].copy_from_slice(&limbs[2].to_le_bytes());
+    le_bytes[24..32].copy_from_slice(&limbs[3].to_le_bytes());
+    let mut repr = <Fr as PrimeField>::Repr::default();
+    repr.as_mut().copy_from_slice(&le_bytes[..]);
+    Fr::from_repr_vartime(repr).ok_or(Error::DecodingError)
+}
 
-    fr
+fn fr_to_u64s(fr: &Fr) -> [u64; 4] {
+    let repr = fr.to_repr();
+    [
+        u64::from_le_bytes(repr[0..8].try_into().unwrap()),
+        u64::from_le_bytes(repr[8..16].try_into().unwrap()),
+        u64::from_le_bytes(repr[16..24].try_into().unwrap()),
+        u64::from_le_bytes(repr[24..32].try_into().unwrap()),
+    ]
 }
 
 fn unpack_fr_array(vec_shape: (Vec<u64>, &[i64])) -> Result<Vec<Fr>, Error> {
@@ -318,10 +331,9 @@ fn unpack_fr_array(vec_shape: (Vec<u64>, &[i64])) -> Result<Vec<Fr>, Error> {
     vec.chunks(chunk_size)
         .map(|x| u64s_into_fr(x))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| Error::DecodingError)
 }
 
-fn unpack_fr_array_from_monts<'a>(monts: &'a [u64]) -> Result<&'a [Fr], Error> {
+fn unpack_fr_array_from_monts(monts: &[u64]) -> Result<&[Fr], Error> {
     let fr_size = 4;
     let fr_count = monts.len() / fr_size;
     assert_eq!(
@@ -340,7 +352,7 @@ fn unpack_fr_array_from_monts<'a>(monts: &'a [u64]) -> Result<&'a [Fr], Error> {
     Ok(frs)
 }
 
-fn as_mont_u64s<'a, U: ArrayLength<Fr>>(vec: &'a [GenericArray<Fr, U>]) -> &'a [u64] {
+fn as_mont_u64s<U: ArrayLength<Fr>>(vec: &[GenericArray<Fr, U>]) -> &[u64] {
     let fr_size = 4; // Number of limbs in Fr.
     assert_eq!(
         fr_size * std::mem::size_of::<u64>(),
@@ -356,7 +368,7 @@ fn as_mont_u64s<'a, U: ArrayLength<Fr>>(vec: &'a [GenericArray<Fr, U>]) -> &'a [
     }
 }
 
-fn frs_as_mont_u64s<'a>(vec: &'a [Fr]) -> &'a [u64] {
+fn frs_as_mont_u64s(vec: &[Fr]) -> &[u64] {
     let fr_size = 4; // Number of limbs in Fr.
     assert_eq!(
         fr_size * std::mem::size_of::<u64>(),
@@ -370,23 +382,21 @@ fn frs_as_mont_u64s<'a>(vec: &'a [Fr]) -> &'a [u64] {
 }
 
 fn as_u64s<U: ArrayLength<Fr>>(vec: &[GenericArray<Fr, U>]) -> Vec<u64> {
-    if vec.len() == 0 {
+    if vec.is_empty() {
         return Vec::new();
     }
     let fr_size = std::mem::size_of::<Fr>();
     let mut safely = Vec::with_capacity(vec.len() * U::to_usize() * fr_size);
-    for i in 0..vec.len() {
-        for j in 0..U::to_usize() {
-            for k in 0..4 {
-                safely.push(vec[i][j].into_repr().0[k]);
-            }
+    for row in vec {
+        for column in row {
+            safely.extend_from_slice(&fr_to_u64s(column))
         }
     }
     safely
 }
 
 fn init_hash2(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherState, Error> {
-    let constants = GPUConstants(PoseidonConstants::<Bls12, U2>::new_with_strength(strength));
+    let constants = GpuConstants(PoseidonConstants::<Fr, U2>::new_with_strength(strength));
     match strength {
         Strength::Standard => {
             let state = ctx
@@ -397,7 +407,7 @@ fn init_hash2(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSta
                     constants.pre_sparse_matrix(&ctx)?,
                     constants.sparse_matrixes(&ctx)?,
                 )
-                .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+                .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
             Ok(BatcherState::Arity2(state))
         }
         Strength::Strengthened => {
@@ -409,14 +419,14 @@ fn init_hash2(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSta
                     constants.pre_sparse_matrix(&ctx)?,
                     constants.sparse_matrixes(&ctx)?,
                 )
-                .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+                .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
             Ok(BatcherState::Arity2s(state))
         }
     }
 }
 
 fn init_hash8(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherState, Error> {
-    let constants = GPUConstants(PoseidonConstants::<Bls12, U8>::new_with_strength(strength));
+    let constants = GpuConstants(PoseidonConstants::<Fr, U8>::new_with_strength(strength));
     match strength {
         Strength::Standard => {
             let state = ctx
@@ -427,7 +437,7 @@ fn init_hash8(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSta
                     constants.pre_sparse_matrix(&ctx)?,
                     constants.sparse_matrixes(&ctx)?,
                 )
-                .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+                .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
             Ok(BatcherState::Arity8(state))
         }
@@ -440,7 +450,7 @@ fn init_hash8(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSta
                     constants.pre_sparse_matrix(&ctx)?,
                     constants.sparse_matrixes(&ctx)?,
                 )
-                .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+                .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
             Ok(BatcherState::Arity8s(state))
         }
@@ -448,7 +458,7 @@ fn init_hash8(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSta
 }
 
 fn init_hash11(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherState, Error> {
-    let constants = GPUConstants(PoseidonConstants::<Bls12, U11>::new_with_strength(strength));
+    let constants = GpuConstants(PoseidonConstants::<Fr, U11>::new_with_strength(strength));
 
     match strength {
         Strength::Standard => {
@@ -460,7 +470,7 @@ fn init_hash11(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSt
                     constants.pre_sparse_matrix(&ctx)?,
                     constants.sparse_matrixes(&ctx)?,
                 )
-                .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+                .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
             Ok(BatcherState::Arity11(state))
         }
@@ -473,7 +483,7 @@ fn init_hash11(ctx: &mut FutharkContext, strength: Strength) -> Result<BatcherSt
                     constants.pre_sparse_matrix(&ctx)?,
                     constants.sparse_matrixes(&ctx)?,
                 )
-                .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+                .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
             Ok(BatcherState::Arity11s(state))
         }
@@ -495,7 +505,7 @@ where
 
     let (res, state) = ctx
         .mbatch_hash2(state, input)
-        .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+        .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
     let (vec, _shape) = res.to_vec()?;
     let frs = unpack_fr_array_from_monts(vec.as_slice())?;
@@ -518,7 +528,7 @@ where
 
     let (res, state) = ctx
         .mbatch_hash8(state, input)
-        .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+        .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
     let (vec, _shape) = res.to_vec()?;
     let frs = unpack_fr_array_from_monts(vec.as_slice())?;
@@ -541,7 +551,7 @@ where
 
     let (res, state) = ctx
         .mbatch_hash11(state, input)
-        .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+        .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
     let (vec, _shape) = res.to_vec()?;
     let frs = unpack_fr_array_from_monts(vec.as_slice())?;
@@ -564,7 +574,7 @@ where
 
     let (res, state) = ctx
         .mbatch_hash2s(state, input)
-        .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+        .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
     let (vec, _shape) = res.to_vec()?;
     let frs = unpack_fr_array_from_monts(vec.as_slice())?;
@@ -587,7 +597,7 @@ where
 
     let (res, state) = ctx
         .mbatch_hash8s(state, input)
-        .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+        .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
     let (vec, _shape) = res.to_vec()?;
     let frs = unpack_fr_array_from_monts(vec.as_slice())?;
@@ -610,7 +620,7 @@ where
 
     let (res, state) = ctx
         .mbatch_hash11s(state, input)
-        .map_err(|e| Error::GPUError(format!("{:?}", e)))?;
+        .map_err(|e| Error::GpuError(format!("{:?}", e)))?;
 
     let (vec, _shape) = res.to_vec()?;
     let frs = unpack_fr_array_from_monts(vec.as_slice())?;
@@ -618,7 +628,7 @@ where
     Ok((frs.to_vec(), state))
 }
 
-fn u64_vec<'a, U: ArrayLength<Fr>>(vec: &'a [GenericArray<Fr, U>]) -> Vec<u64> {
+fn u64_vec<U: ArrayLength<Fr>>(vec: &[GenericArray<Fr, U>]) -> Vec<u64> {
     vec![0; vec.len() * U::to_usize() * std::mem::size_of::<Fr>()]
 }
 
@@ -627,13 +637,13 @@ fn u64_vec<'a, U: ArrayLength<Fr>>(vec: &'a [GenericArray<Fr, U>]) -> Vec<u64> {
 /// So skip GPU tests by default since real code paths are now enabled.
 /// Users will probably not want to actually run with GPU on macos,
 /// But if experiments show it is viable, then it is possible.
-#[cfg(all(feature = "gpu", not(target_os = "macos")))]
+#[cfg(all(feature = "futhark", not(target_os = "macos")))]
 mod tests {
     use super::*;
     use crate::poseidon::{Poseidon, SimplePoseidonBatchHasher};
     use crate::triton::gpu::BatcherState;
     use crate::BatchHasher;
-    use ff::{Field, ScalarEngine};
+    use ff::Field;
     use generic_array::sequence::GenericSequence;
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
@@ -651,15 +661,14 @@ mod tests {
         };
         let batch_size = 100;
 
-        let mut gpu_hasher = GPUBatchHasher::<U2>::new_with_strength(
+        let mut gpu_hasher = GpuBatchHasher::<U2>::new_with_strength(
             cl::default_futhark_context().unwrap(),
             Strength::Standard,
             batch_size,
         )
         .unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U2>::new_with_strength(Strength::Standard, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U2>::new_with_strength(Strength::Standard, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U2>::generate(|_| Fr::random(&mut rng)))
@@ -688,15 +697,14 @@ mod tests {
         };
         let batch_size = 100;
 
-        let mut gpu_hasher = GPUBatchHasher::<U2>::new_with_strength(
+        let mut gpu_hasher = GpuBatchHasher::<U2>::new_with_strength(
             cl::default_futhark_context().unwrap(),
             Strength::Strengthened,
             batch_size,
         )
         .unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U2>::new_with_strength(Strength::Strengthened, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U2>::new_with_strength(Strength::Strengthened, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U2>::generate(|_| Fr::random(&mut rng)))
@@ -715,7 +723,7 @@ mod tests {
     fn test_mbatch_hash8() {
         let mut rng = XorShiftRng::from_seed(crate::TEST_SEED);
         let ctx = cl::default_futhark_context().unwrap();
-        let mut state = if let BatcherState::Arity8(s) =
+        let state = if let BatcherState::Arity8(s) =
             init_hash8(&mut ctx.lock().unwrap(), Strength::Standard).unwrap()
         {
             s
@@ -724,22 +732,21 @@ mod tests {
         };
         let batch_size = 100;
 
-        let mut gpu_hasher = GPUBatchHasher::<U8>::new_with_strength(
+        let mut gpu_hasher = GpuBatchHasher::<U8>::new_with_strength(
             cl::default_futhark_context().unwrap(),
             Strength::Standard,
             batch_size,
         )
         .unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U8>::new_with_strength(Strength::Standard, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U8>::new_with_strength(Strength::Standard, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U8>::generate(|_| Fr::random(&mut rng)))
             .collect::<Vec<_>>();
 
         let (hashes, _) =
-            mbatch_hash8(&mut ctx.lock().unwrap(), &mut state, preimages.as_slice()).unwrap();
+            mbatch_hash8(&mut ctx.lock().unwrap(), &state, preimages.as_slice()).unwrap();
         let gpu_hashes = gpu_hasher.hash(&preimages).unwrap();
         let expected_hashes: Vec<_> = simple_hasher.hash(&preimages).unwrap();
 
@@ -751,7 +758,7 @@ mod tests {
     fn test_mbatch_hash8s() {
         let mut rng = XorShiftRng::from_seed(crate::TEST_SEED);
         let ctx = cl::default_futhark_context().unwrap();
-        let mut state = if let BatcherState::Arity8s(s) =
+        let state = if let BatcherState::Arity8s(s) =
             init_hash8(&mut ctx.lock().unwrap(), Strength::Strengthened).unwrap()
         {
             s
@@ -760,22 +767,21 @@ mod tests {
         };
         let batch_size = 100;
 
-        let mut gpu_hasher = GPUBatchHasher::<U8>::new_with_strength(
+        let mut gpu_hasher = GpuBatchHasher::<U8>::new_with_strength(
             cl::default_futhark_context().unwrap(),
             Strength::Strengthened,
             batch_size,
         )
         .unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U8>::new_with_strength(Strength::Strengthened, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U8>::new_with_strength(Strength::Strengthened, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U8>::generate(|_| Fr::random(&mut rng)))
             .collect::<Vec<_>>();
 
         let (hashes, _) =
-            mbatch_hash8s(&mut ctx.lock().unwrap(), &mut state, preimages.as_slice()).unwrap();
+            mbatch_hash8s(&mut ctx.lock().unwrap(), &state, preimages.as_slice()).unwrap();
         let gpu_hashes = gpu_hasher.hash(&preimages).unwrap();
         let expected_hashes: Vec<_> = simple_hasher.hash(&preimages).unwrap();
 
@@ -787,7 +793,7 @@ mod tests {
     fn test_mbatch_hash11() {
         let mut rng = XorShiftRng::from_seed(crate::TEST_SEED);
         let ctx = cl::default_futhark_context().unwrap();
-        let mut state = if let BatcherState::Arity11(s) =
+        let state = if let BatcherState::Arity11(s) =
             init_hash11(&mut ctx.lock().unwrap(), Strength::Standard).unwrap()
         {
             s
@@ -796,22 +802,21 @@ mod tests {
         };
         let batch_size = 100;
 
-        let mut gpu_hasher = GPUBatchHasher::<U11>::new_with_strength(
+        let mut gpu_hasher = GpuBatchHasher::<U11>::new_with_strength(
             cl::default_futhark_context().unwrap(),
             Strength::Standard,
             batch_size,
         )
         .unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U11>::new_with_strength(Strength::Standard, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U11>::new_with_strength(Strength::Standard, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U11>::generate(|_| Fr::random(&mut rng)))
             .collect::<Vec<_>>();
 
         let (hashes, _) =
-            mbatch_hash11(&mut ctx.lock().unwrap(), &mut state, preimages.as_slice()).unwrap();
+            mbatch_hash11(&mut ctx.lock().unwrap(), &state, preimages.as_slice()).unwrap();
         let gpu_hashes = gpu_hasher.hash(&preimages).unwrap();
         let expected_hashes: Vec<_> = simple_hasher.hash(&preimages).unwrap();
 
@@ -823,7 +828,7 @@ mod tests {
     fn test_mbatch_hash11s() {
         let mut rng = XorShiftRng::from_seed(crate::TEST_SEED);
         let ctx = cl::default_futhark_context().unwrap();
-        let mut state = if let BatcherState::Arity11s(s) =
+        let state = if let BatcherState::Arity11s(s) =
             init_hash11(&mut ctx.lock().unwrap(), Strength::Strengthened).unwrap()
         {
             s
@@ -832,22 +837,21 @@ mod tests {
         };
         let batch_size = 100;
 
-        let mut gpu_hasher = GPUBatchHasher::<U11>::new_with_strength(
+        let mut gpu_hasher = GpuBatchHasher::<U11>::new_with_strength(
             cl::default_futhark_context().unwrap(),
             Strength::Strengthened,
             batch_size,
         )
         .unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U11>::new_with_strength(Strength::Strengthened, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U11>::new_with_strength(Strength::Strengthened, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U11>::generate(|_| Fr::random(&mut rng)))
             .collect::<Vec<_>>();
 
         let (hashes, _) =
-            mbatch_hash11s(&mut ctx.lock().unwrap(), &mut state, preimages.as_slice()).unwrap();
+            mbatch_hash11s(&mut ctx.lock().unwrap(), &state, preimages.as_slice()).unwrap();
         let gpu_hashes = gpu_hasher.hash(&preimages).unwrap();
         let expected_hashes: Vec<_> = simple_hasher.hash(&preimages).unwrap();
 
@@ -858,7 +862,7 @@ mod tests {
     fn test_mbatch_hash8_on_device(dev: Arc<Mutex<FutharkContext>>) {
         let mut rng = XorShiftRng::from_seed(crate::TEST_SEED);
         let ctx = cl::default_futhark_context().unwrap();
-        let mut state = if let BatcherState::Arity8(s) =
+        let state = if let BatcherState::Arity8(s) =
             init_hash8(&mut ctx.lock().unwrap(), Strength::Standard).unwrap()
         {
             s
@@ -868,17 +872,16 @@ mod tests {
         let batch_size = 100;
 
         let mut gpu_hasher =
-            GPUBatchHasher::<U8>::new_with_strength(dev, Strength::Standard, batch_size).unwrap();
+            GpuBatchHasher::<U8>::new_with_strength(dev, Strength::Standard, batch_size).unwrap();
         let mut simple_hasher =
-            SimplePoseidonBatchHasher::<U8>::new_with_strength(Strength::Standard, batch_size)
-                .unwrap();
+            SimplePoseidonBatchHasher::<U8>::new_with_strength(Strength::Standard, batch_size);
 
         let preimages = (0..batch_size)
             .map(|_| GenericArray::<Fr, U8>::generate(|_| Fr::random(&mut rng)))
             .collect::<Vec<_>>();
 
         let (hashes, _) =
-            mbatch_hash8(&mut ctx.lock().unwrap(), &mut state, preimages.as_slice()).unwrap();
+            mbatch_hash8(&mut ctx.lock().unwrap(), &state, preimages.as_slice()).unwrap();
         let gpu_hashes = gpu_hasher.hash(&preimages).unwrap();
         let expected_hashes: Vec<_> = simple_hasher.hash(&preimages).unwrap();
 

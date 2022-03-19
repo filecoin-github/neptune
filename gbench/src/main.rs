@@ -1,34 +1,27 @@
-use bellperson::bls::Fr;
+use blstrs::Scalar as Fr;
 use ff::Field;
 use generic_array::sequence::GenericSequence;
 use generic_array::typenum::{U11, U8};
 use generic_array::GenericArray;
 use log::info;
-use neptune::batch_hasher::BatcherType;
 use neptune::column_tree_builder::{ColumnTreeBuilder, ColumnTreeBuilderTrait};
-use neptune::error::Error;
-use neptune::BatchHasher;
-use rust_gpu_tools::opencl::GPUSelector;
-use std::result::Result;
+use neptune::{batch_hasher::Batcher, BatchHasher};
+use rust_gpu_tools::{Device, UniqueId};
+use std::convert::TryFrom;
 use std::thread;
 use std::time::Instant;
 use structopt::StructOpt;
 
 fn bench_column_building(
     log_prefix: &str,
-    batcher_type: Option<BatcherType>,
+    column_batcher: Batcher<U11>,
+    tree_batcher: Batcher<U8>,
     leaves: usize,
-    max_column_batch_size: usize,
-    max_tree_batch_size: usize,
 ) -> Fr {
     info!("{}: Creating ColumnTreeBuilder", log_prefix);
-    let mut builder = ColumnTreeBuilder::<U11, U8>::new(
-        batcher_type,
-        leaves,
-        max_column_batch_size,
-        max_tree_batch_size,
-    )
-    .unwrap();
+    let mut builder =
+        ColumnTreeBuilder::<U11, U8>::new(Some(column_batcher), Some(tree_batcher), leaves)
+            .unwrap();
     info!("{}: ColumnTreeBuilder created", log_prefix);
 
     // Simplify computing the expected root.
@@ -106,8 +99,8 @@ struct Opts {
     max_column_batch_size: usize,
 }
 
-fn main() -> Result<(), Error> {
-    #[cfg(all(any(feature = "gpu", feature = "opencl"), target_os = "macos"))]
+fn main() {
+    #[cfg(all(any(feature = "cuda", feature = "opencl"), target_os = "macos"))]
     unimplemented!("Running on macos is not recommended and may have bad consequences -- experiment at your own risk.");
     env_logger::init();
 
@@ -128,34 +121,29 @@ fn main() -> Result<(), Error> {
     // Comma separated list of GPU bus-ids
     let gpus = std::env::var("NEPTUNE_GBENCH_GPUS");
 
-    #[cfg(feature = "gpu")]
-    let default_type = BatcherType::GPU;
+    let default_device = *Device::all().first().expect("Cannot get a default device");
 
-    #[cfg(feature = "opencl")]
-    let default_type = BatcherType::OpenCL;
-
-    let batcher_types = gpus
+    let devices = gpus
         .map(|v| {
-            v.split(",")
-                .map(|s| s.parse::<u32>().expect("Invalid Bus-Id number!"))
-                .map(|bus_id| BatcherType::CustomGPU(GPUSelector::BusId(bus_id)))
+            v.split(',')
+                .map(|s| UniqueId::try_from(s).expect("Invalid unique ID!"))
+                .map(|unique_id| {
+                    Device::by_unique_id(unique_id)
+                        .unwrap_or_else(|| panic!("No device with unique ID {} found!", unique_id))
+                })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or(vec![default_type]);
+        .unwrap_or_else(|_| vec![default_device]);
 
     let mut threads = Vec::new();
-    for batcher_type in batcher_types {
+    for device in devices {
         threads.push(thread::spawn(move || {
-            let log_prefix = format!("GPU[Selector: {:?}]", batcher_type);
+            let log_prefix = format!("GPU[{:?}]", device);
             for i in 0..3 {
                 info!("{} --> Run {}", log_prefix, i);
-                bench_column_building(
-                    &log_prefix,
-                    Some(batcher_type.clone()),
-                    leaves,
-                    max_column_batch_size,
-                    max_tree_batch_size,
-                );
+                let column_batcher = Batcher::new(device, max_column_batch_size).unwrap();
+                let tree_batcher = Batcher::new(device, max_tree_batch_size).unwrap();
+                bench_column_building(&log_prefix, column_batcher, tree_batcher, leaves);
             }
         }));
     }
@@ -165,5 +153,4 @@ fn main() -> Result<(), Error> {
     info!("end");
     // Leave time to verify GPU memory usage goes to zero before exiting.
     std::thread::sleep(std::time::Duration::from_millis(15000));
-    Ok(())
 }

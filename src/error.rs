@@ -1,9 +1,9 @@
-#[cfg(feature = "gpu")]
+#[cfg(feature = "futhark")]
 use crate::triton::cl;
 use std::{error, fmt};
 
 #[derive(Debug, Clone)]
-#[cfg(any(feature = "gpu", feature = "opencl"))]
+#[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
 pub enum ClError {
     DeviceNotFound,
     PlatformNotFound,
@@ -16,10 +16,10 @@ pub enum ClError {
     GetDeviceError,
 }
 
-#[cfg(any(feature = "gpu", feature = "opencl"))]
+#[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
 pub type ClResult<T> = std::result::Result<T, ClError>;
 
-#[cfg(any(feature = "gpu", feature = "opencl"))]
+#[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
 impl fmt::Display for ClError {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
@@ -49,27 +49,33 @@ pub enum Error {
     FullBuffer,
     /// Attempt to reference an index element that is out of bounds
     IndexOutOfBounds,
-    /// The provided leaf was not found in the tree
-    GPUError(String),
-    #[cfg(any(feature = "gpu", feature = "opencl"))]
+    GpuError(String),
+    #[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
     ClError(ClError),
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "futhark")]
     TritonError(String),
     DecodingError,
     Other(String),
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "futhark")]
 impl From<ClError> for Error {
     fn from(e: ClError) -> Self {
         Self::ClError(e)
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "futhark")]
 impl From<triton::Error> for Error {
     fn from(e: triton::Error) -> Self {
         Self::TritonError(e.to_string())
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+impl From<rust_gpu_tools::GPUError> for Error {
+    fn from(e: rust_gpu_tools::GPUError) -> Self {
+        Self::GpuError(format!("GPU tools error: {}", e))
     }
 }
 
@@ -83,10 +89,10 @@ impl fmt::Display for Error {
                 "The size of the buffer cannot be greater than the hash arity."
             ),
             Error::IndexOutOfBounds => write!(f, "The referenced index is outs of bounds."),
-            Error::GPUError(s) => write!(f, "GPU Error: {}", s),
-            #[cfg(any(feature = "gpu", feature = "opencl"))]
+            Error::GpuError(s) => write!(f, "GPU Error: {}", s),
+            #[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
             Error::ClError(e) => write!(f, "OpenCL Error: {}", e),
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "futhark")]
             Error::TritonError(e) => write!(f, "Neptune-triton Error: {}", e),
             Error::DecodingError => write!(f, "PrimeFieldDecodingError"),
             Error::Other(s) => write!(f, "{}", s),

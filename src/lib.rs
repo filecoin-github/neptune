@@ -5,15 +5,34 @@ extern crate lazy_static;
 
 pub use crate::poseidon::{Arity, Poseidon};
 use crate::round_constants::generate_constants;
-use crate::round_numbers::calc_round_numbers;
-pub use bellperson::bls::Fr as Scalar;
-use bellperson::bls::FrRepr;
+use crate::round_numbers::{round_numbers_base, round_numbers_strengthened};
+use blstrs::Scalar as Fr;
 pub use error::Error;
-use ff::{Field, PrimeField, ScalarEngine};
+use ff::PrimeField;
 use generic_array::GenericArray;
 
-#[cfg(all(feature = "gpu", feature = "opencl"))]
-compile_error!("gpu and opencl features are mutually exclusive");
+#[cfg(all(feature = "futhark", any(feature = "cuda", feature = "opencl")))]
+compile_error!("`futhark` and `cuda/opencl` features are mutually exclusive");
+
+#[cfg(all(
+    any(feature = "cuda", feature = "opencl"),
+    not(any(
+        feature = "arity2",
+        feature = "arity4",
+        feature = "arity8",
+        feature = "arity11",
+        feature = "arity16",
+        feature = "arity24",
+        feature = "arity36"
+    ))
+))]
+compile_error!("The `cuda` and `opencl` features need at least one arity feature to be set");
+
+#[cfg(all(
+    feature = "strengthened",
+    not(any(feature = "cuda", feature = "opencl"))
+))]
+compile_error!("The `strengthened` feature needs the `cuda` and/or `opencl` feature to be set");
 
 /// Poseidon circuit
 pub mod circuit;
@@ -32,21 +51,21 @@ mod round_numbers;
 pub mod hash_type;
 
 /// Tree Builder
-#[cfg(any(feature = "gpu", feature = "opencl"))]
+#[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
 pub mod tree_builder;
 
 /// Column Tree Builder
-#[cfg(any(feature = "gpu", feature = "opencl"))]
+#[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
 pub mod column_tree_builder;
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "futhark")]
 pub mod triton;
 
 /// Batch Hasher
-#[cfg(any(feature = "gpu", feature = "opencl"))]
+#[cfg(any(feature = "futhark", feature = "cuda", feature = "opencl"))]
 pub mod batch_hasher;
 
-#[cfg(feature = "opencl")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod proteus;
 
 pub(crate) const TEST_SEED: [u8; 16] = [
@@ -63,21 +82,22 @@ pub(crate) const DEFAULT_STRENGTH: Strength = Strength::Standard;
 
 pub trait BatchHasher<A>
 where
-    A: Arity<Scalar>,
+    A: Arity<Fr>,
 {
     // type State;
 
-    fn hash(&mut self, preimages: &[GenericArray<Scalar, A>]) -> Result<Vec<Scalar>, Error>;
+    fn hash(&mut self, preimages: &[GenericArray<Fr, A>]) -> Result<Vec<Fr>, Error>;
 
     fn hash_into_slice(
         &mut self,
-        target_slice: &mut [Scalar],
-        preimages: &[GenericArray<Scalar, A>],
+        target_slice: &mut [Fr],
+        preimages: &[GenericArray<Fr, A>],
     ) -> Result<(), Error> {
         assert_eq!(target_slice.len(), preimages.len());
         // FIXME: Account for max batch size.
 
-        Ok(target_slice.copy_from_slice(self.hash(preimages)?.as_slice()))
+        target_slice.copy_from_slice(self.hash(preimages)?.as_slice());
+        Ok(())
     }
 
     /// `max_batch_size` is advisory. Implenters of `BatchHasher` should ensure that up to the returned max hashes can
@@ -89,29 +109,6 @@ where
     }
 }
 
-// Returns the round numbers for a given arity `(R_F, R_P)`.
-fn round_numbers_base(arity: usize) -> (usize, usize) {
-    let t = arity + 1;
-    calc_round_numbers(t, true)
-}
-
-// In case of newly-discovered attacks, we may need stronger security.
-// This option exists so we can preemptively create circuits in order to switch
-// to them quickly if needed.
-//
-// "A realistic alternative is to increase the number of partial rounds by 25%.
-// Then it is unlikely that a new attack breaks through this number,
-// but even if this happens then the complexity is almost surely above 2^64, and you will be safe."
-// - D Khovratovich
-fn round_numbers_strengthened(arity: usize) -> (usize, usize) {
-    let (full_round, partial_rounds) = round_numbers_base(arity);
-
-    // Increase by 25%, rounding up.
-    let strengthened_partial_rounds = f64::ceil(partial_rounds as f64 * 1.25) as usize;
-
-    (full_round, strengthened_partial_rounds)
-}
-
 pub fn round_numbers(arity: usize, strength: &Strength) -> (usize, usize) {
     match strength {
         Strength::Standard => round_numbers_base(arity),
@@ -119,20 +116,22 @@ pub fn round_numbers(arity: usize, strength: &Strength) -> (usize, usize) {
     }
 }
 
-/// convert
-pub fn scalar_from_u64<Fr: PrimeField>(i: u64) -> Fr {
-    Fr::from_repr(<Fr::Repr as From<u64>>::from(i)).unwrap()
-}
-
-/// create field element from four u64
-pub fn scalar_from_u64s(parts: [u64; 4]) -> Scalar {
-    Scalar::from_repr(FrRepr(parts)).unwrap()
+#[cfg(test)]
+pub(crate) fn scalar_from_u64s(parts: [u64; 4]) -> Fr {
+    let mut le_bytes = [0u8; 32];
+    le_bytes[0..8].copy_from_slice(&parts[0].to_le_bytes());
+    le_bytes[8..16].copy_from_slice(&parts[1].to_le_bytes());
+    le_bytes[16..24].copy_from_slice(&parts[2].to_le_bytes());
+    le_bytes[24..32].copy_from_slice(&parts[3].to_le_bytes());
+    let mut repr = <Fr as PrimeField>::Repr::default();
+    repr.as_mut().copy_from_slice(&le_bytes[..]);
+    Fr::from_repr_vartime(repr).expect("u64s exceed BLS12-381 scalar field modulus")
 }
 
 const SBOX: u8 = 1; // x^5
 const FIELD: u8 = 1; // Gf(p)
 
-fn round_constants<E: ScalarEngine>(arity: usize, strength: &Strength) -> Vec<E::Fr> {
+fn round_constants<F: PrimeField>(arity: usize, strength: &Strength) -> Vec<F> {
     let t = arity + 1;
 
     let (full_rounds, partial_rounds) = round_numbers(arity, strength);
@@ -140,28 +139,24 @@ fn round_constants<E: ScalarEngine>(arity: usize, strength: &Strength) -> Vec<E:
     let r_f = full_rounds as u16;
     let r_p = partial_rounds as u16;
 
-    let fr_num_bits = E::Fr::NUM_BITS;
+    let fr_num_bits = F::NUM_BITS;
     let field_size = {
         assert!(fr_num_bits <= std::u16::MAX as u32);
         // It's safe to convert to u16 for compatibility with other types.
         fr_num_bits as u16
     };
 
-    generate_constants::<E>(FIELD, SBOX, field_size, t as u16, r_f, r_p)
+    generate_constants::<F>(FIELD, SBOX, field_size, t as u16, r_f, r_p)
 }
 
 /// Apply the quintic S-Box (s^5) to a given item
-pub(crate) fn quintic_s_box<E: ScalarEngine>(
-    l: &mut E::Fr,
-    pre_add: Option<&E::Fr>,
-    post_add: Option<&E::Fr>,
-) {
+pub(crate) fn quintic_s_box<F: PrimeField>(l: &mut F, pre_add: Option<&F>, post_add: Option<&F>) {
     if let Some(x) = pre_add {
         l.add_assign(x);
     }
-    let mut tmp = l.clone();
-    tmp.square(); // l^2
-    tmp.square(); // l^4
+    let mut tmp = *l;
+    tmp = tmp.square(); // l^2
+    tmp = tmp.square(); // l^4
     l.mul_assign(&tmp); // l^5
     if let Some(x) = post_add {
         l.add_assign(x);
