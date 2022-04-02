@@ -52,10 +52,12 @@ incremental = false
 codegen-units = 1
 
 [features]
-default = []
+default = ["cpu-optimization"]
 cuda = ["rust-gpu-tools/cuda", "blstrs/gpu", "ec-gpu-gen", "ec-gpu"]
 futhark = ["triton", "rust-gpu-tools/opencl"]
 opencl = ["rust-gpu-tools/opencl", "blstrs/gpu", "ec-gpu-gen", "ec-gpu"]
+cpu-optimization = ["bellperson/cpu-optimization"]
+
 # The supported arities for Poseidon running on the GPU are specified at compile-time.
 arity2 = []
 arity4 = []
